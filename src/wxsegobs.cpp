@@ -21,10 +21,6 @@
 #define keys    "7dfeff9f01e8d86545ee4d495bf5d723"
 
 
-static wx_vseg_handle_t handle = nullptr;
-static cv::Mat frame, alpha, bg,setbgpic, setbgcolor,blend;
-static cv::Mat blurt;
-static bool setbginit = false;
 
 static void resizeAndCrop(const cv::Mat& input, int width, int height, cv::Mat& output)
 {
@@ -67,9 +63,15 @@ typedef struct wx_seg_filter
 	bool disseg = false;
 	bool blurbg = true;
 	bool usesetbg = false;
-	char* bgpath;
+	std::string bgpath;
 	bool usesetcolor = false;
 	cv::Scalar backgroundColor{ 0, 0, 0 };
+
+	// Per-instance state (previously file-level globals shared by every filter instance)
+	wx_vseg_handle_t handle = nullptr;
+	cv::Mat alpha, bg, setbgpic, setbgcolor, blend, blurt;
+	bool setbginit = false;
+	int lastWidth = 0, lastHeight = 0;
 
 	//CriticalSection mutex;
 	//vector<Action> actions;
@@ -186,7 +188,7 @@ static bool tracking_setbg_modified(obs_properties_t* props, obs_property_t* pro
 		obs_data_set_bool(settings, "setcolor", false);
 
 	}
-	setbginit = false;
+	// setbginit is reset per instance in filter_update()
 
 	return true;
 }
@@ -217,7 +219,7 @@ static bool tracking_secolor_modified(obs_properties_t* props, obs_property_t* p
 		obs_data_set_bool(settings, "setbg", false);
 
 	}
-	setbginit = false;
+	// setbginit is reset per instance in filter_update()
 
 	return true;
 }
@@ -321,13 +323,14 @@ static void filter_update(void *data, obs_data_t *settings)
 	wsf->disseg = obs_data_get_bool(settings, "seg_disen");
 	wsf->blurbg = obs_data_get_bool(settings, "blurbgbool");
 	wsf->usesetbg = obs_data_get_bool(settings, "setbg");
-	wsf->bgpath = (char*)obs_data_get_string(settings, "bgpic");
+	const char* bgp = obs_data_get_string(settings, "bgpic");
+	wsf->bgpath = bgp ? bgp : "";
 	wsf->usesetcolor = obs_data_get_bool(settings, "setcolor");
 	uint64_t color = obs_data_get_int(settings, "bgColor");
 	wsf->backgroundColor.val[0] = (double)((color >> 16) & 0x0000ff);
 	wsf->backgroundColor.val[1] = (double)((color >> 8) & 0x0000ff);
 	wsf->backgroundColor.val[2] = (double)(color & 0x0000ff);
-	setbginit = false;
+	wsf->setbginit = false;
 }
 
 
@@ -345,30 +348,27 @@ static void destroyScalers(struct wx_seg_filter* wsf)
 }
 static void * filter_create(obs_data_t *settings, obs_source_t *source)
 {
-	struct wx_seg_filter* wsf =reinterpret_cast<wx_seg_filter*>(bzalloc(sizeof(struct wx_seg_filter)));
-	setbginit = false;
+	// C++ members (cv::Mat, std::string) need real construction, so new/delete (not bzalloc/bfree)
+	struct wx_seg_filter* wsf = new wx_seg_filter();
 	int res;
-
-
-
-	if (handle) {
-		wx_vseg_handle_release(handle);
-		handle = nullptr;
-	}
 
 	// 设置license文件,
 	// 第一个参数设置为您的app_key
 	char* licFilepath_rawPtr = obs_module_file(licfile);
-	if ((res = wx_vseg_lic_set_key_and_file(keys, licFilepath_rawPtr)) != 0) {
+	res = wx_vseg_lic_set_key_and_file(keys, licFilepath_rawPtr);
+	bfree(licFilepath_rawPtr);
+	if (res != 0) {
 		const char* errmsg = wx_vseg_get_last_error_msg();
-		printf("set license fail: %d, %s\n", res, errmsg);
+		blog(LOG_ERROR, "[wx_seg_obs] set license fail: %d, %s", res, errmsg ? errmsg : "");
+		delete wsf;
 		return nullptr;
 	}
 
-	// 创建抠图handle
-	res = wx_vseg_handle_create(0, 0, 0, nullptr, &handle);
+	// 创建抠图handle (one per filter instance)
+	res = wx_vseg_handle_create(0, 0, 0, nullptr, &wsf->handle);
 	if (res != 0) {
-		printf("wx_vseg_handle_create fail: %d\n", res);
+		blog(LOG_ERROR, "[wx_seg_obs] wx_vseg_handle_create fail: %d", res);
+		delete wsf;
 		return nullptr;
 	}
 	//虽然还未create	 但是必须这call  update ，否则影响控件状态
@@ -449,6 +449,22 @@ static struct obs_source_frame *filter_render(void *data,struct obs_source_frame
 	cv::Mat imageBGR = convertFrameToBGR(frame, wsf);
 
 	wx_image_t img_frame = { imageBGR.cols, imageBGR.rows,WX_IMG_BGR24,(int)imageBGR.step[0],imageBGR.data };
+
+	// The source resolution can change (e.g. a camera that starts at 640x480 and then
+	// switches to 1280x720). Re-allocate every size-dependent buffer when it does.
+	cv::Mat& alpha = wsf->alpha;
+	cv::Mat& blend = wsf->blend;
+	cv::Mat& bg = wsf->bg;
+	cv::Mat& blurt = wsf->blurt;
+	cv::Mat& setbgpic = wsf->setbgpic;
+	cv::Mat& setbgcolor = wsf->setbgcolor;
+	if (wsf->lastWidth != imageBGR.cols || wsf->lastHeight != imageBGR.rows) {
+		wsf->lastWidth = imageBGR.cols;
+		wsf->lastHeight = imageBGR.rows;
+		alpha.release();
+		blend.release();
+		wsf->setbginit = false;
+	}
 	if (alpha.empty()) {
 		alpha.create(imageBGR.rows, imageBGR.cols, CV_32FC1);
 	}
@@ -458,9 +474,9 @@ static struct obs_source_frame *filter_render(void *data,struct obs_source_frame
 	img_alpha.data = alpha.data;
 
 	// 对本帧进行抠图，返回alpha
-	int res = wx_vseg_sync(handle, &img_frame, &img_alpha);
+	int res = wx_vseg_sync(wsf->handle, &img_frame, &img_alpha);
 	if (res != 0) {
-		printf("wx_vseg_sync fail: %d\n", res);
+		blog(LOG_WARNING, "[wx_seg_obs] wx_vseg_sync fail: %d", res);
 	}
 	else {
 		if (blend.empty())
@@ -504,7 +520,7 @@ static struct obs_source_frame *filter_render(void *data,struct obs_source_frame
 
 
 
-		if (setbginit == false)
+		if (wsf->setbginit == false)
 		{
 			//#ifdef   _WIN32
 			//std::string mFilepath_s(path);
@@ -522,21 +538,22 @@ static struct obs_source_frame *filter_render(void *data,struct obs_source_frame
 
 			//FILE* pFile = _wfopen(path_ws.c_str(), L"rb");
 			//setlocale(LC_ALL, "Chinese-simplified");//设置中文环境
-			FILE* pFile = os_fopen(wsf->bgpath,"rb"); //fopen
-			fseek(pFile, 0, SEEK_END);
-			long lSize = ftell(pFile);
-			rewind(pFile);
-			char* pData = new char[lSize];
-			fread(pData, sizeof(char), lSize, pFile);
-			fclose(pFile);
+			setbgpic.release();
+			FILE* pFile = os_fopen(wsf->bgpath.c_str(),"rb"); //fopen
+			if (pFile) {
+				fseek(pFile, 0, SEEK_END);
+				long lSize = ftell(pFile);
+				rewind(pFile);
+				std::vector<char> cvdata((size_t)(lSize > 0 ? lSize : 0));
+				if (lSize > 0)
+					fread(cvdata.data(), sizeof(char), (size_t)lSize, pFile);
+				fclose(pFile);
+				if (!cvdata.empty())
+					setbgpic = cv::imdecode(cvdata, cv::IMREAD_COLOR);
+			} else {
+				blog(LOG_WARNING, "[wx_seg_obs] cannot open background image: %s", wsf->bgpath.c_str());
+			}
 
-			std::vector<char> cvdata(pData, pData + lSize);
-			//std::vector<uchar> cvdata; 
-			//for (int i = 0; i < lSize; ++i) 
-			//	cvdata.push_back(pData[i]);
-
-			setbgpic = cv::imdecode(cvdata, cv::IMREAD_COLOR);
-			
 			//setbgpic = cv::imread(wsf->bgpath);
 
 			if (setbgpic.empty())
@@ -547,7 +564,7 @@ static struct obs_source_frame *filter_render(void *data,struct obs_source_frame
 			if (setbgpic.rows != imageBGR.rows || setbgpic.cols != imageBGR.cols)
 				resizeAndCrop(setbgpic, imageBGR.cols, imageBGR.rows, setbgpic);
 
-			setbginit = true;
+			wsf->setbginit = true;
 
 
 			setbgcolor.create(imageBGR.rows, imageBGR.cols, CV_8UC3);
@@ -564,15 +581,15 @@ static struct obs_source_frame *filter_render(void *data,struct obs_source_frame
 		if(wsf->blurbg)
 			img_bg = { bg.cols,bg.rows, WX_IMG_BGR24,(int)bg.step[0],bg.data };
 		else if(wsf->usesetbg)
-			img_bg = { setbgpic.cols,bg.rows, WX_IMG_BGR24,(int)setbgpic.step[0],setbgpic.data };
+			img_bg = { setbgpic.cols,setbgpic.rows, WX_IMG_BGR24,(int)setbgpic.step[0],setbgpic.data };
 		else
-			img_bg = { setbgcolor.cols,bg.rows, WX_IMG_BGR24,(int)setbgcolor.step[0],setbgcolor.data };
+			img_bg = { setbgcolor.cols,setbgcolor.rows, WX_IMG_BGR24,(int)setbgcolor.step[0],setbgcolor.data };
 
 
 		// 图像融合
 		res = wx_vseg_blend(&img_frame, &img_bg, &img_alpha, &img_blend);
 		if (res != 0) {
-			printf("failed in wx_vseg_blend, res: %d\n", res);
+			blog(LOG_WARNING, "[wx_seg_obs] wx_vseg_blend failed: %d", res);
 		}
 
 		//cv::imshow("blend", blend);
@@ -589,18 +606,14 @@ static void filter_destroy(void *data)
 {
 	struct wx_seg_filter* wsf =	reinterpret_cast<wx_seg_filter*>(data);
 
-	if (wsf) {
-		destroyScalers(wsf);
-		bfree(wsf);
+	if (!wsf)
+		return;
+	destroyScalers(wsf);
+	if (wsf->handle) {
+		wx_vseg_handle_release(wsf->handle);
+		wsf->handle = nullptr;
 	}
-	if (!alpha.empty())
-		alpha.release();
-	if (!blend.empty())
-		blend.release();
-	if (handle) {
-		wx_vseg_handle_release(handle);
-		handle = nullptr;
-	}
+	delete wsf; // releases the per-instance cv::Mat buffers
 }
 
 struct obs_source_info wx_seg_filter_info = {
